@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Feynman Sprinkler</title>
+<style>
+  body { margin: 0; background: #0e1117; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; }
+  .canvas-wrap { position: relative; width: 800px; height: 800px; }
+  .canvas-wrap canvas { position: absolute; top: 0; left: 0; width: 800px; height: 800px; }
+  #fallback { color: white; font-family: monospace; display: none; }
+</style>
+</head>
+<body>
+<div>
+  <div class="canvas-wrap">
+    <canvas id="c" width="800" height="800"></canvas>
+    <canvas id="overlay" width="800" height="800" style="pointer-events:none;"></canvas>
+  </div>
+  <div style="text-align:center; margin-top:8px;">
+    <label style="color:#ccc; font-family:monospace;">
+      Fan Force: <input type="range" id="fanSlider" min="0" max="10" step="0.1" value="5" style="width:300px; vertical-align:middle;">
+      <span id="fanVal" style="color:#ffaa00;">5.0</span>
+    </label>
+  </div>
+</div>
+<div id="fallback">WebGPU not supported in this browser.</div>
+<script>
+const N = 3200;
+const DOMAIN = 5.0;
+const THERMAL_SPEED = 0.333;
+const RADIUS = 0.06;  // particle radius in world units
+
+async function main() {
+  if (!navigator.gpu) {
+    document.getElementById('fallback').style.display = 'block';
+    document.getElementById('c').style.display = 'none';
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  // Initialize particle data: [x, y, vx, vy] per particle
+  const particleData = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    particleData[i * 4 + 0] = (Math.random() * 2 - 1) * DOMAIN; // x
+    particleData[i * 4 + 1] = (Math.random() * 2 - 1) * DOMAIN; // y
+    // Box-Muller for normal distribution
+    const u1 = Math.random(), u2 = Math.random();
+    const r = THERMAL_SPEED * Math.sqrt(-2 * Math.log(u1));
+    particleData[i * 4 + 2] = r * Math.cos(2 * Math.PI * u2); // vx
+    particleData[i * 4 + 3] = r * Math.sin(2 * Math.PI * u2); // vy
+  }
+
+  const particleBuf = device.createBuffer({
+    size: particleData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(particleBuf, 0, particleData);
+
+  // Render pipeline — instanced quads with circle discard
+  // Quad vertices: 2 triangles forming a square [-1,-1] to [1,1]
+  const quadVerts = new Float32Array([
+    -1, -1,   1, -1,   1, 1,
+    -1, -1,   1,  1,  -1, 1,
+  ]);
+  const quadBuf = device.createBuffer({
+    size: quadVerts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(quadBuf, 0, quadVerts);
+
+  const renderShader = device.createShaderModule({ code: `
+    struct VSOut {
+      @builtin(position) pos: vec4f,
+      @location(0) uv: vec2f,
+      @location(1) speed: f32,
+    };
+
+    struct Particle {
+      x: f32, y: f32, vx: f32, vy: f32,
+    };
+
+    @group(0) @binding(0) var<storage, read> particles: array<Particle>;
+
+    @vertex
+    fn vs(
+      @location(0) quad: vec2f,
+      @builtin(instance_index) ii: u32,
+    ) -> VSOut {
+      let p = particles[ii];
+      let r = ${(RADIUS / DOMAIN).toFixed(6)};  // radius in clip space
+      let clipX = p.x / ${DOMAIN.toFixed(1)} + quad.x * r;
+      let clipY = p.y / ${DOMAIN.toFixed(1)} + quad.y * r;
+      let speed = sqrt(p.vx * p.vx + p.vy * p.vy);
+      return VSOut(vec4f(clipX, clipY, 0.0, 1.0), quad, speed);
+    }
+
+    // Attempt at jet colormap approximation in WGSL
+    fn jet(t_in: f32) -> vec3f {
+      let t = clamp(t_in, 0.0, 1.0);
+      // red
+      let r = clamp(1.5 - abs(t - 0.75) * 4.0, 0.0, 1.0);
+      // green
+      let g = clamp(1.5 - abs(t - 0.5) * 4.0, 0.0, 1.0);
+      // blue
+      let b = clamp(1.5 - abs(t - 0.25) * 4.0, 0.0, 1.0);
+      return vec3f(r, g, b);
+    }
+
+    @group(0) @binding(1) var<uniform> speedRange: vec3f; // p5, median, p95
+
+    @fragment
+    fn fs(@location(0) uv: vec2f, @location(1) speed: f32) -> @location(0) vec4f {
+      let d = dot(uv, uv);
+      if (d > 1.0) { discard; }
+      let alpha = 1.0 - smoothstep(0.7, 1.0, d);
+
+      // Percentile remap: [p5,median]->0..0.5, [median,p95]->0.5..1.0
+      let p5 = speedRange.x;
+      let med = speedRange.y;
+      let p95 = speedRange.z;
+      var t: f32;
+      if (speed <= med) {
+        t = 0.5 * (speed - p5) / max(med - p5, 1e-6);
+      } else {
+        t = 0.5 + 0.5 * (speed - med) / max(p95 - med, 1e-6);
+      }
+      t = clamp(t, 0.0, 1.0);
+
+      let col = jet(t);
+      return vec4f(col, alpha * 0.85);
+    }
+  `});
+
+  const renderPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: renderShader,
+      entryPoint: 'vs',
+      buffers: [{
+        arrayStride: 8,
+        stepMode: 'vertex',
+        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+      }],
+    },
+    fragment: {
+      module: renderShader,
+      entryPoint: 'fs',
+      targets: [{
+        format,
+        blend: {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+        },
+      }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // ── Compute: fan force + collisions + move + walls ───────────────────
+  // Brute force O(N²) collisions — fine for 3200 particles on GPU
+  const computeShader = device.createShaderModule({ code: `
+    struct Particle {
+      x: f32, y: f32, vx: f32, vy: f32,
+    };
+
+    @group(0) @binding(0) var<storage, read> particlesIn: array<Particle>;
+    @group(0) @binding(1) var<storage, read_write> particlesOut: array<Particle>;
+    @group(0) @binding(2) var<uniform> params: Params;
+    @group(0) @binding(3) var<storage, read_write> keSum: atomic<u32>;
+
+    struct Params {
+      fanForce: f32,
+    };
+
+    const N: u32 = ${N}u;
+    const DT: f32 = 0.03;
+    const DOMAIN: f32 = ${DOMAIN.toFixed(1)};
+    const RADIUS: f32 = ${RADIUS};
+    const DIAM: f32 = ${RADIUS * 2};
+    const DIAM2: f32 = ${(RADIUS * 2) ** 2};
+    const FAN_X0: f32 = -0.3;
+    const FAN_X1: f32 =  0.3;
+    const FAN_Y0: f32 = -0.6;
+    const FAN_Y1: f32 =  0.6;
+
+    @compute @workgroup_size(256)
+    fn main(@builtin(global_invocation_id) gid: vec3u) {
+      let i = gid.x;
+      if (i >= N) { return; }
+
+      var p = particlesIn[i];
+
+      // Fan force
+      if (p.x > FAN_X0 && p.x < FAN_X1 && p.y > FAN_Y0 && p.y < FAN_Y1) {
+        p.vx += params.fanForce * DT;
+      }
+
+      // Collisions: accumulate impulse from all overlapping particles
+      var dvx: f32 = 0.0;
+      var dvy: f32 = 0.0;
+      var dpx: f32 = 0.0;
+      var dpy: f32 = 0.0;
+
+      for (var j: u32 = 0u; j < N; j++) {
+        if (j == i) { continue; }
+        let q = particlesIn[j];
+        let dx = p.x - q.x;
+        let dy = p.y - q.y;
+        let dist2 = dx * dx + dy * dy;
+
+        if (dist2 < DIAM2 && dist2 > 1e-12) {
+          let dist = sqrt(dist2);
+          let nx = dx / dist;
+          let ny = dy / dist;
+
+          // Relative velocity along collision normal
+          let rel_vn = (p.vx - q.vx) * nx + (p.vy - q.vy) * ny;
+
+          // Only if approaching
+          if (rel_vn < 0.0) {
+            // Equal mass elastic: this particle gets -rel_vn along normal
+            dvx -= rel_vn * nx;
+            dvy -= rel_vn * ny;
+          }
+
+          // Separate overlap
+          let overlap = DIAM - dist;
+          dpx += 0.5 * overlap * nx;
+          dpy += 0.5 * overlap * ny;
+        }
+      }
+
+      p.vx += dvx;
+      p.vy += dvy;
+      p.x += dpx;
+      p.y += dpy;
+
+      // Move
+      p.x += p.vx * DT;
+      p.y += p.vy * DT;
+
+      // Reflective walls
+      if (p.x < -DOMAIN) { p.x = -2.0 * DOMAIN - p.x; p.vx = abs(p.vx); }
+      if (p.x >  DOMAIN) { p.x =  2.0 * DOMAIN - p.x; p.vx = -abs(p.vx); }
+      if (p.y < -DOMAIN) { p.y = -2.0 * DOMAIN - p.y; p.vy = abs(p.vy); }
+      if (p.y >  DOMAIN) { p.y =  2.0 * DOMAIN - p.y; p.vy = -abs(p.vy); }
+
+      // Write KE to atomic sum (fixed-point: multiply by 1000 to preserve precision)
+      let ke = p.vx * p.vx + p.vy * p.vy;
+      atomicAdd(&keSum, u32(ke * 1000.0));
+
+      particlesOut[i] = p;
+    }
+  `});
+
+  // Thermostat shader: rescale velocities to match target KE
+  const thermoShader = device.createShaderModule({ code: `
+    struct Particle {
+      x: f32, y: f32, vx: f32, vy: f32,
+    };
+
+    @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
+    @group(0) @binding(1) var<storage, read_write> keSum: atomic<u32>;
+    @group(0) @binding(2) var<uniform> targetKE: f32;
+
+    const N: u32 = ${N}u;
+
+    @compute @workgroup_size(256)
+    fn main(@builtin(global_invocation_id) gid: vec3u) {
+      let i = gid.x;
+      if (i >= N) { return; }
+
+      let currentKE = f32(atomicLoad(&keSum)) / 1000.0;
+      if (currentKE < 1e-6) { return; }
+      let scale = sqrt(targetKE / currentKE);
+
+      particles[i].vx *= scale;
+      particles[i].vy *= scale;
+    }
+  `});
+
+  const thermoPipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: thermoShader, entryPoint: 'main' },
+  });
+
+  const computePipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: computeShader, entryPoint: 'main' },
+  });
+
+  // Double buffer: read from A, write to B, then swap
+  const particleBufB = device.createBuffer({
+    size: particleData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+
+  const paramData = new Float32Array([5.0]);
+  const paramBuf = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(paramBuf, 0, paramData);
+
+  // KE sum buffer (atomic u32)
+  const keSumBuf = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  // Target KE — compute from initial velocities
+  let targetKE = 0;
+  for (let i = 0; i < N; i++) {
+    targetKE += particleData[i*4+2]**2 + particleData[i*4+3]**2;
+  }
+  const targetKEBuf = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(targetKEBuf, 0, new Float32Array([targetKE]));
+
+  // Speed percentiles — compute from initial data
+  // With thermostat, the speed distribution stays roughly constant
+  const initSpeeds = [];
+  for (let i = 0; i < N; i++) {
+    const svx = particleData[i*4+2], svy = particleData[i*4+3];
+    initSpeeds.push(Math.sqrt(svx*svx + svy*svy));
+  }
+  initSpeeds.sort((a, b) => a - b);
+  const p5 = initSpeeds[Math.floor(N * 0.05)];
+  const median = initSpeeds[Math.floor(N * 0.5)];
+  const p95 = initSpeeds[Math.floor(N * 0.95)];
+
+  const speedRangeBuf = device.createBuffer({
+    size: 16, // vec3f padded to 16
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(speedRangeBuf, 0, new Float32Array([p5, median, p95, 0]));
+
+  // Two bind groups for ping-pong
+  const computeBG_AB = device.createBindGroup({
+    layout: computePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: particleBuf } },
+      { binding: 1, resource: { buffer: particleBufB } },
+      { binding: 2, resource: { buffer: paramBuf } },
+      { binding: 3, resource: { buffer: keSumBuf } },
+    ],
+  });
+  const computeBG_BA = device.createBindGroup({
+    layout: computePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: particleBufB } },
+      { binding: 1, resource: { buffer: particleBuf } },
+      { binding: 2, resource: { buffer: paramBuf } },
+      { binding: 3, resource: { buffer: keSumBuf } },
+    ],
+  });
+
+  // Thermostat bind groups
+  const thermoBG_A = device.createBindGroup({
+    layout: thermoPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: particleBuf } },
+      { binding: 1, resource: { buffer: keSumBuf } },
+      { binding: 2, resource: { buffer: targetKEBuf } },
+    ],
+  });
+  const thermoBG_B = device.createBindGroup({
+    layout: thermoPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: particleBufB } },
+      { binding: 1, resource: { buffer: keSumBuf } },
+      { binding: 2, resource: { buffer: targetKEBuf } },
+    ],
+  });
+
+  const renderBG_A = device.createBindGroup({
+    layout: renderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: particleBuf } },
+      { binding: 1, resource: { buffer: speedRangeBuf } },
+    ],
+  });
+  const renderBG_B = device.createBindGroup({
+    layout: renderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: particleBufB } },
+      { binding: 1, resource: { buffer: speedRangeBuf } },
+    ],
+  });
+
+  let pingpong = 0;
+  const workgroups = Math.ceil(N / 256);
+
+
+  // Draw fan region overlay
+  const oc = document.getElementById('overlay').getContext('2d');
+  const wx = (w) => (w / DOMAIN + 1) * 400; // world x -> pixel x
+  const wy = (w) => (1 - w / DOMAIN) * 400; // world y -> pixel y (flipped)
+  const x0 = wx(-0.3), x1 = wx(0.3), y0 = wy(0.6), y1 = wy(-0.6);
+  oc.fillStyle = 'rgba(68, 51, 0, 0.4)';
+  oc.strokeStyle = '#ffaa00';
+  oc.lineWidth = 2;
+  oc.fillRect(x0, y0, x1 - x0, y1 - y0);
+  oc.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  // Arrow pointing right through center
+  const cy = wy(0), al = wx(-0.25), ar = wx(0.45);
+  oc.beginPath();
+  oc.moveTo(al, cy);
+  oc.lineTo(ar, cy);
+  oc.lineTo(ar - 8, cy - 6);
+  oc.moveTo(ar, cy);
+  oc.lineTo(ar - 8, cy + 6);
+  oc.stroke();
+
+  // Slider
+  const slider = document.getElementById('fanSlider');
+  const fanVal = document.getElementById('fanVal');
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    fanVal.textContent = v.toFixed(1);
+    device.queue.writeBuffer(paramBuf, 0, new Float32Array([v]));
+  });
+
+  function frame() {
+    const encoder = device.createCommandEncoder();
+
+    // Clear KE sum
+    encoder.clearBuffer(keSumBuf);
+
+    // Compute pass: fan + collisions + move + walls + accumulate KE
+    const cpass = encoder.beginComputePass();
+    cpass.setPipeline(computePipeline);
+    cpass.setBindGroup(0, pingpong === 0 ? computeBG_AB : computeBG_BA);
+    cpass.dispatchWorkgroups(workgroups);
+    cpass.end();
+
+    pingpong = 1 - pingpong;
+
+    // Thermostat pass: rescale velocities to target KE
+    const tpass = encoder.beginComputePass();
+    tpass.setPipeline(thermoPipeline);
+    tpass.setBindGroup(0, pingpong === 0 ? thermoBG_A : thermoBG_B);
+    tpass.dispatchWorkgroups(workgroups);
+    tpass.end();
+
+    // Render pass — read from the buffer we just wrote to
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: ctx.getCurrentTexture().createView(),
+        clearValue: { r: 0.055, g: 0.067, b: 0.09, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(renderPipeline);
+    pass.setVertexBuffer(0, quadBuf);
+    pass.setBindGroup(0, pingpong === 0 ? renderBG_A : renderBG_B);
+    pass.draw(6, N);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+main();
+</script>
+</body>
+</html>
